@@ -1,0 +1,225 @@
+# LAiM Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import inspect
+import sys
+from .common import (
+    TEMPORARY_PATCHES,
+    torch_compile,
+    _torch_compile,
+    get_torch_compile_options,
+    UNSLOTH_ENABLE_LOGGING,
+)
+from .utils import (
+    patch_function,
+    patch_function_past_key_values,
+    dedent,
+    KWARGS_TYPE,
+    raise_error,
+    logger,
+    Cache,
+    process_return,
+)
+from LAiM_zoo.hf_utils import dtype_from_config
+from .moe_utils import (
+    patch_param_wrapper_for_moe,
+    get_forward_moe_backend,
+    extract_moe_lora_weights_for_grouped_mm,
+)
+
+def patch_deepseek_v3():
+    """Patch DeepSeekV3 MoE to support Split LoRA via grouped GEMM, and the CausalLM forward for GRPO."""
+    _patch_deepseek_v3_naive_moe()
+    # Independent of the MoE classes: transformers 4.x and >= 5.13 have no DeepseekV3NaiveMoe.
+    return _patch_deepseek_v3_causal_lm_forward()
+
+
+def _patch_deepseek_v3_naive_moe():
+    # This LAiM Zoo code section is licensed under AGPL3
+
+    try:
+        from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+            DeepseekV3NaiveMoe,
+            DeepseekV3MoE,
+            DeepseekV3TopkRouter,
+            DeepseekV3Config,
+        )
+    except Exception as e:
+        return  # DeepSeekV3 not available yet
+
+    if hasattr(DeepseekV3NaiveMoe, "_unsloth_already_patched"):
+        return
+
+    # Patch PEFT ParamWrapper for separated LoRA weights
+    patch_param_wrapper_for_moe()
+
+    # LoRA extraction function for DeepSeekV3 (standard format)
+    def _deepseek_v3_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+        return extract_moe_lora_weights_for_grouped_mm(
+            wrapper,
+            weight_A,
+            weight_B,
+            scaling,
+            num_experts,
+            model_name="DeepSeekV3 MoE",
+            enable_logging=UNSLOTH_ENABLE_LOGGING,
+            logger_obj=logger,
+        )
+
+    # Register extractor on the class (staticmethod, not bound) + mark model type
+    DeepseekV3NaiveMoe._unsloth_lora_extractor_fn = staticmethod(_deepseek_v3_lora_extractor)
+    DeepseekV3NaiveMoe._unsloth_model_type = "deepseek_v3"
+    DeepseekV3NaiveMoe._unsloth_already_patched = True
+
+    # DeepseekV3NaiveMoe.forward -> backend dispatch in moe_utils
+    patch_function(DeepseekV3NaiveMoe, "forward", get_forward_moe_backend())
+
+    def patched_moe_forward(self, hidden_states):
+        """Forward that marks model type for proper LoRA extraction."""
+        residuals = hidden_states
+        orig_shape = hidden_states.shape
+        router_logits = self.gate(hidden_states)
+        topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+        # Mark the experts module for proper LoRA extraction
+        self.experts._unsloth_model_type = "deepseek_v3"
+
+        hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(
+            *orig_shape
+        )
+        hidden_states = hidden_states + self.shared_experts(residuals)
+        return hidden_states
+
+    patch_function(DeepseekV3MoE, "forward", patched_moe_forward)
+
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: Patched DeepSeekV3 MoE for Split LoRA support.")
+
+
+def _patch_deepseek_v3_causal_lm_forward():
+    # Patch DeepseekV3ForCausalLM.forward for GRPO: return hidden_states instead
+    # of logits when UNSLOTH_RETURN_HIDDEN_STATES=1.
+    try:
+        from transformers.models.deepseek_v3 import modeling_deepseek_v3
+        from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+
+        # transformers 5.19 returns MoeCausalLMOutputWithPast and no longer imports
+        # CausalLMOutputWithPast into this module; earlier versions only have the latter.
+        _output_class = getattr(modeling_deepseek_v3, "MoeCausalLMOutputWithPast", None) or getattr(
+            modeling_deepseek_v3, "CausalLMOutputWithPast", None
+        )
+        if _output_class is None:
+            from transformers.modeling_outputs import CausalLMOutputWithPast as _output_class
+        _output_has_router_logits = "router_logits" in getattr(_output_class, "__dataclass_fields__", {})
+
+        _original_causal_lm_forward = DeepseekV3ForCausalLM.forward
+        # Temporary patches run at init, pre_compile and post_compile: wrap each class once.
+        if getattr(_original_causal_lm_forward, "_unsloth_hidden_states_wrapper", False):
+            return True
+
+        def _patched_causal_lm_forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=None,
+            labels=None,
+            use_cache=None,
+            output_router_logits=None,
+            cache_position=None,
+            logits_to_keep=0,
+            **kwargs,
+        ):
+            # This LAiM Zoo code section is licensed under AGPL3
+
+            RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+
+            if not RETURN_HIDDEN_STATES:
+                return _original_causal_lm_forward(
+                    self,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    labels=labels,
+                    use_cache=use_cache,
+                    output_router_logits=output_router_logits,
+                    cache_position=cache_position,
+                    logits_to_keep=logits_to_keep,
+                    **kwargs,
+                )
+
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_router_logits=output_router_logits,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            hidden_states = outputs.last_hidden_state
+
+            # Slice hidden_states the same way logits would be (logits_to_keep)
+            if logits_to_keep != 0:
+                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+                hidden_states = hidden_states[:, slice_indices, :]
+
+            # Return hidden_states as "logits" for GRPO
+            extra = {}
+            if _output_has_router_logits:
+                extra["router_logits"] = getattr(outputs, "router_logits", None)
+            return _output_class(
+                loss=None,
+                logits=hidden_states,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                **extra,
+            )
+
+        # Preserve __qualname__ so _unsloth_get_batch_samples can detect
+        # this is a CausalLM forward and compute num_items_in_batch properly.
+        _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
+        # Lets the compiler read (and fuse the loss of) the real forward, as with functools.wraps.
+        _patched_causal_lm_forward.__wrapped__ = _original_causal_lm_forward
+        _patched_causal_lm_forward._unsloth_hidden_states_wrapper = True
+        DeepseekV3ForCausalLM.forward = _patched_causal_lm_forward
+        # unsloth's GRPO reads this marker and skips its output_hidden_states fallback, which keeps every layer's hidden states.
+        DeepseekV3ForCausalLM.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True
+        patch_function(DeepseekV3ForCausalLM, "forward", _patched_causal_lm_forward)
+
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info("Unsloth: Patched DeepSeekV3ForCausalLM.forward for GRPO hidden states.")
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Could not patch DeepSeekV3ForCausalLM.forward: {e}")
+
+    return True
+
+
+TEMPORARY_PATCHES.append(patch_deepseek_v3)

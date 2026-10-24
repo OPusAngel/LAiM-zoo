@@ -1,0 +1,331 @@
+# LAiM Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+import torch
+import torch.nn as nn
+import weakref
+from .common import TEMPORARY_PATCHES, torch_compile
+from .utils import (
+    patch_function,
+    KWARGS_TYPE,
+    raise_error,
+)
+import contextlib
+
+def _fp32_autocast(device_type):
+    # float32 autocast is CUDA only; elsewhere it disables the enclosing autocast and fp32 x bf16 weights raise.
+    if device_type != "cuda":
+        return contextlib.nullcontext()
+    return torch.autocast(device_type = device_type, dtype = torch.float32, enabled = True)
+
+def patch_Gemma3nConvNormAct_forward():
+    try:
+        import timm.layers.conv_bn_act
+        timm.layers.conv_bn_act.ConvNormAct
+    except Exception as e:
+        return raise_error("timm.layers.conv_bn_act.ConvNormAct", e)
+
+    # Counteract high weights in Conv layers for Gemma 3N by forcing to float32
+    def forward(self, x):
+        old_dtype = x.dtype
+        x = x.to(torch.float32)
+        with _fp32_autocast(x.device.type):
+            x = self.conv(x)
+        x = self.bn(x)
+        aa = getattr(self, 'aa', None)
+        if aa is not None:
+            x = self.aa(x)
+        return x.to(old_dtype)
+    pass
+    patch_function(timm.layers.conv_bn_act.ConvNormAct, "forward", forward, fullgraph = True)
+pass
+# We only execute this for float16 so it's not always executed
+# TEMPORARY_PATCHES.append(patch_Gemma3nConvNormAct_forward)
+
+@torch_compile
+def Gemma3nRMSNorm_forward(self, x: torch.Tensor) -> torch.Tensor:
+    # Llama does x.to(float16) * w whilst Gemma2 is (x * w).to(float16)
+    # See https://github.com/huggingface/transformers/pull/29402
+    output = self._norm(x.float())
+    # transformers 5.5 dropped the tensor(1.0) weight of with_scale=False norms.
+    if getattr(self, "with_scale", True) and hasattr(self, "weight"):
+        output = output * self.weight.float()
+    return output.type_as(x)
+
+def patch_Gemma3nMultimodalEmbedder_forward():
+    try:
+        import transformers.models.gemma3n.modeling_gemma3n
+        from transformers.models.gemma3n.modeling_gemma3n import Gemma3nMultimodalEmbedder
+    except Exception as e:
+        return raise_error("timm.layers.multimodal_embedder.MultimodalEmbedder", e)
+
+    def Gemma3nMultimodalEmbedder_forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is not None:
+            emb_norm = Gemma3nRMSNorm_forward(self.soft_embedding_norm, inputs_embeds)
+        else:
+            hard_emb = self.embedding(input_ids - self.vocab_offset)
+            emb_norm = Gemma3nRMSNorm_forward(self.hard_embedding_norm, hard_emb)
+
+        old_dtype = emb_norm.dtype
+        emb_norm = emb_norm.to(torch.float32)
+        with _fp32_autocast(emb_norm.device.type):
+            emb_norm_proj = self.embedding_projection(emb_norm)
+        emb_norm_proj = emb_norm_proj.to(old_dtype)
+
+        return Gemma3nRMSNorm_forward(self.embedding_post_projection_norm, emb_norm_proj)
+    pass
+
+    patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nMultimodalEmbedder, "forward", Gemma3nMultimodalEmbedder_forward, fullgraph = True)
+pass
+
+def patch_Gemma3nTextAltUp_predict():
+    try:
+        import transformers.models.gemma3n.modeling_gemma3n
+        from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
+    except Exception as e:
+        return raise_error("Gemma3nTextAltUp.predict", e)
+
+    def predict(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        new_dtype = self.router_input_scale.dtype
+        hidden_states = hidden_states.to(new_dtype)
+        x = hidden_states[self.config.altup_active_idx]
+        router_inputs = Gemma3nRMSNorm_forward(self.router_norm, x) * self.router_input_scale
+        routed = self.modality_router(router_inputs)
+        modalities = torch.tanh(routed.float()).type_as(x)
+
+        if self.training and self.config.altup_coef_clip is not None:
+            self.prediction_coefs.weight.data.clamp_(-self.config.altup_coef_clip, self.config.altup_coef_clip)
+
+        # Project and then transpose all 2D matrices contained so that mulmat gives the correct result
+        all_coefs: torch.Tensor = (
+            self.prediction_coefs(modalities)
+            .reshape(*modalities.shape[:-1], self.config.altup_num_inputs, self.config.altup_num_inputs)
+            .permute(0, 1, 3, 2)
+        )
+
+        # permute hidden_states to [batch_size, num_tokens, hidden_size, altup_num_inputs]
+        predictions = torch.matmul(hidden_states.permute(1, 2, 3, 0), all_coefs)
+        predictions = predictions.permute(3, 0, 1, 2)  # undo the permute
+        predictions += hidden_states  # add the original input
+        return predictions.contiguous().type_as(hidden_states)
+    pass
+    patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "predict", predict, fullgraph = True)
+pass
+
+def patch_Gemma3nConv_Embed_forwards():
+    # helper function to patch both forwards
+    try:
+        patch_Gemma3nConvNormAct_forward()
+        patch_Gemma3nMultimodalEmbedder_forward()
+        patch_Gemma3nTextAltUp_predict()
+    except Exception as e:
+        return raise_error("patch_Gemma3nConv_Embed_forwards", e)
+pass
+
+
+def patch_Gemma3nTextAltUp_functions():
+    try:
+        import transformers.models.gemma3n.modeling_gemma3n
+        from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
+    except Exception as e:
+        return raise_error("Gemma3nTextAltUp", e)
+
+    if hasattr(Gemma3nTextAltUp, "predict"):
+        patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "predict", Gemma3nTextAltUp.predict, fullgraph = True)
+    if hasattr(Gemma3nTextAltUp, "correct"):
+        patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "correct", Gemma3nTextAltUp.correct, fullgraph = True)
+    if hasattr(Gemma3nTextAltUp, "scale_corrected_output"):
+        patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "scale_corrected_output", Gemma3nTextAltUp.scale_corrected_output, fullgraph = True)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3nTextAltUp_functions)
+
+def patch_Gemma3nModel_get_placeholder_mask():
+    try:
+        import transformers.models.gemma3n.modeling_gemma3n
+        from transformers.models.gemma3n.modeling_gemma3n import Gemma3nModel
+    except Exception as e:
+        return raise_error("Gemma3nModel.get_place_holder_mask", e)
+
+    def get_placeholder_mask(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        image_features: Optional[torch.FloatTensor] = None,
+        audio_features: Optional[torch.FloatTensor] = None,
+    ):
+        """
+        Obtains multimodal placeholdr mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
+        equal to the length of multimodal features. If the lengths are different, an error is raised.
+        """
+        if input_ids is None:
+            special_image_mask = inputs_embeds == self.get_input_embeddings()(
+                torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+            )
+            special_image_mask = special_image_mask.all(-1)
+            special_audio_mask = (
+                inputs_embeds
+                == self.get_input_embeddings()(
+                    torch.tensor(self.config.audio_token_id, dtype=torch.long, device=inputs_embeds.device)
+                )
+            ).all(-1)
+        else:
+            special_image_mask = input_ids == self.config.image_token_id
+            special_audio_mask = input_ids == self.config.audio_token_id
+
+        n_image_tokens = special_image_mask.sum()
+        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
+            raise ValueError(
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0] * image_features.shape[1]}"
+            )
+
+        n_audio_tokens = special_audio_mask.sum()
+        special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        if audio_features is not None and inputs_embeds[special_audio_mask].numel() != audio_features.numel():
+            raise ValueError(
+                f"Audio features and image tokens do not match: tokens: {n_audio_tokens}, features {audio_features.shape[0] * audio_features.shape[1]}"
+            )
+
+        return special_image_mask, special_audio_mask
+    pass
+    patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nModel, "get_placeholder_mask", get_placeholder_mask, match_level="relaxed")
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3nModel_get_placeholder_mask)
+
+
+class _Gemma3nSharedKV:
+    # Cache stand-in: carries shared_layers, update() stores nothing.
+    def __init__(self):
+        self.shared_layers = {}
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        return key_states, value_states
+pass
+
+
+class _Gemma3nInjectSharedKVGrad(torch.autograd.Function):
+    # Identity whose backward adds the shared layers' KV gradient to the source layer's recomputed KV.
+    @staticmethod
+    def forward(ctx, attn_output, key_states, value_states, grad_key, grad_value):
+        ctx.save_for_backward(grad_key, grad_value)
+        return attn_output.view_as(attn_output)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_key, grad_value = ctx.saved_tensors
+        return grad_output, grad_key, grad_value, None, None
+pass
+
+
+_GEMMA3N_SHARED_KV = {}
+_GEMMA3N_ATTENTION_FORWARD = {}
+_GEMMA3N_KV_LEAVES_KEY = "_unsloth_kv_leaves"
+
+def _gemma3n_shared_kv_stand_in(config, anchor):
+    # One stand-in per forward: every layer of a forward, and its checkpoint recompute, gets the same
+    # rotary cos tensor, so it scopes the entry and a finalizer drops it with that tensor.
+    key = (id(config), None if anchor is None else id(anchor))
+    stand_in = _GEMMA3N_SHARED_KV.get(key)
+    if stand_in is None:
+        stand_in = _GEMMA3N_SHARED_KV[key] = _Gemma3nSharedKV()
+        if anchor is not None:
+            weakref.finalize(anchor, _GEMMA3N_SHARED_KV.pop, key, None)
+    return stand_in
+pass
+
+def _gemma3n_attention_forward_shared_kv(self, *args, **kwargs):
+    if _GEMMA3N_ATTENTION_FORWARD.get("mode") == "kwarg":
+        shared = kwargs.get("shared_kv_states")
+    else:
+        holder = kwargs.get("past_key_values", kwargs.get("past_key_value"))
+        if holder is None and len(args) < 4 and (self.is_kv_shared_layer or self.store_full_length_kv):
+            position_embeddings = kwargs.get("position_embeddings", args[1] if len(args) > 1 else None)
+            anchor = position_embeddings[0] if isinstance(position_embeddings, (tuple, list)) else None
+            holder = _gemma3n_shared_kv_stand_in(self.config, anchor)
+            kwargs.pop("past_key_value", None)
+            kwargs["past_key_values"] = holder
+        shared = getattr(holder, "shared_layers", None)
+
+    # Reentrant checkpointing stores source KV with no graph and recomputes shared layers first:
+    # collect their KV gradient on leaves and hand it to the source layer's recompute below.
+    # Leaves live in the mapping itself (plain dict on 5.6 - 5.8, UserDict later), which is only indexed by layer.
+    grad_enabled = torch.is_grad_enabled()
+    leaves = shared.get(_GEMMA3N_KV_LEAVES_KEY) if shared is not None else None
+    if self.is_kv_shared_layer and shared is not None and grad_enabled:
+        index = self.kv_shared_layer_index
+        stored = shared.get(index)
+        if stored is not None and not stored[0].requires_grad:
+            if leaves is None:
+                leaves = shared[_GEMMA3N_KV_LEAVES_KEY] = {}
+            entry = leaves.get(index)
+            if entry is None or entry[0] is not stored[0]:
+                entry = leaves[index] = (stored[0], stored[0].detach().requires_grad_(), stored[1].detach().requires_grad_())
+            shared[index] = (entry[1], entry[2])
+
+    output = _GEMMA3N_ATTENTION_FORWARD["original"](self, *args, **kwargs)
+
+    if self.store_full_length_kv and leaves is not None:
+        entry = leaves.pop(self.layer_idx, None)
+        stored = shared.get(self.layer_idx)
+        if entry is not None and grad_enabled and stored is not None and stored[0].requires_grad:
+            grad_key, grad_value = entry[1].grad, entry[2].grad
+            if grad_key is not None or grad_value is not None:
+                grad_key = torch.zeros_like(stored[0]) if grad_key is None else grad_key.to(stored[0].dtype)
+                grad_value = torch.zeros_like(stored[1]) if grad_value is None else grad_value.to(stored[1].dtype)
+                attn_output = _Gemma3nInjectSharedKVGrad.apply(output[0], stored[0], stored[1], grad_key, grad_value)
+                output = (attn_output, *output[1:])
+    return output
+pass
+
+def patch_Gemma3nTextAttention_kv_sharing():
+    # transformers <= 5.5 shares KV only through the cache, so uncached training ran KV-shared layers
+    # on their own KV (gemma-3n-E2B loss 10.85 vs 5.94); 5.6+ uses shared_kv_states.
+    try:
+        import inspect
+        import transformers.models.gemma3n.modeling_gemma3n as modeling
+        Gemma3nTextAttention = modeling.Gemma3nTextAttention
+        source = inspect.getsource(modeling)
+    except Exception as e:
+        return raise_error("Gemma3nTextAttention.forward", e)
+    if "shared_kv_states[self.kv_shared_layer_index]" in source:
+        mode = "kwarg"
+    elif "past_key_values.shared_layers[self.kv_shared_layer_index]" in source:
+        mode = "cache"
+    else:
+        return
+    current = Gemma3nTextAttention.forward
+    if getattr(current, "_unsloth_gemma3n_kv_sharing", False):
+        return
+    # First original only: a later pass must not wrap the compiler's rebuilt forward.
+    _GEMMA3N_ATTENTION_FORWARD.setdefault("original", current)
+    _GEMMA3N_ATTENTION_FORWARD["mode"] = mode
+
+    # Self-contained body: the compiler copies it into its own module.
+    def forward(self, *args, **kwargs):
+        from LAiM_zoo.temporary_patches.gemma3n import _gemma3n_attention_forward_shared_kv
+        return _gemma3n_attention_forward_shared_kv(self, *args, **kwargs)
+    forward._unsloth_gemma3n_kv_sharing = True
+    Gemma3nTextAttention.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3nTextAttention_kv_sharing)
